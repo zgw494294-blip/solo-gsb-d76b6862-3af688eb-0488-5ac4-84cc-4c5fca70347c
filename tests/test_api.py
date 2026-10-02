@@ -1929,3 +1929,572 @@ def test_withdraw_preview_works_after_merge_and_conflict_commit():
             "clock": {"r1": 0, "r2": 1},
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Import sessions (staged, out-of-order offline events)
+# ---------------------------------------------------------------------------
+
+
+def sess_create(hid):
+    return client.post(f"/api/histories/{hid}/import-sessions")
+
+
+def sess_get(hid, sid):
+    return client.get(f"/api/histories/{hid}/import-sessions/{sid}")
+
+
+def sess_append(hid, sid, events):
+    return client.post(
+        f"/api/histories/{hid}/import-sessions/{sid}/events",
+        json={"events": events},
+    )
+
+
+def sess_commit(hid, sid):
+    return client.post(f"/api/histories/{hid}/import-sessions/{sid}/commit")
+
+
+def test_import_session_create_get_and_404s():
+    hid = create_conflict_history()
+
+    r = sess_create(hid)
+    assert r.status_code == 201, r.text
+    data = r.json()
+    sid = data["id"]
+    assert isinstance(sid, str) and len(sid) >= 16
+    assert data["history_id"] == hid
+    assert data["status"] == "open"
+    assert data["event_count"] == 0
+    assert data["events"] == []
+    assert data["replica_ids"] == ["r1", "r2"]
+
+    got = sess_get(hid, sid)
+    assert got.status_code == 200, got.text
+    assert got.json() == {
+        "id": sid,
+        "history_id": hid,
+        "status": "open",
+        "event_count": 0,
+        "events": [],
+    }
+
+    # Unknown history (create / any session op) -> 404 history_not_found.
+    missing = "f" * 32
+    assert sess_create(missing).status_code == 404
+    assert (
+        sess_get(missing, sid).json()["detail"][0]["code"]
+        == "history_not_found"
+    )
+    assert sess_append(
+        missing, sid, [ev("r1", 1, "k", put="x", clock={"r1": 1, "r2": 0})]
+    ).status_code == 404
+    assert sess_commit(missing, sid).status_code == 404
+
+    # Unknown session (existing history) -> 404 session_not_found...
+    r = sess_get(hid, "1" * 32)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "session_not_found"
+    assert sess_append(
+        hid, "1" * 32, [ev("r1", 1, "k", put="x", clock={"r1": 1, "r2": 0})]
+    ).status_code == 404
+    assert sess_commit(hid, "1" * 32).status_code == 404
+
+    # ...and a session that belongs to another history is reported as not
+    # found on that history's path.
+    other = create_conflict_history()
+    r = sess_get(other, sid)
+    assert r.status_code == 404
+    assert r.json()["detail"][0]["code"] == "session_not_found"
+    assert sess_commit(other, sid).status_code == 404
+
+
+def test_import_session_accepts_out_of_order_arrivals_with_missing_deps():
+    # History starts with r1/1. r2/2 is staged before its predecessor r2/1
+    # and before r1/2 (which its clock references): staging tolerates both.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+
+    r = sess_append(
+        hid,
+        sid,
+        [
+            ev("r2", 2, "k2", put="x", clock={"r1": 2, "r2": 2}),
+            ev("r1", 3, "k3", put="y", clock={"r1": 3, "r2": 2}),
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["event_count"] == 2
+    # Staged events come back sorted by replica_id then seq.
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 3),
+        ("r2", 2),
+    ]
+
+    # Staging is invisible to the committed history while the session is open.
+    got = hist_get(hid).json()
+    assert [(e["replica_id"], e["seq"]) for e in got["events"]] == [("r1", 1)]
+
+
+def test_import_session_staging_validation_per_event_only():
+    hid = create_conflict_history()
+    sid = sess_create(hid).json()["id"]
+
+    # Unknown replica_id -> 422 (nothing staged).
+    r = sess_append(
+        hid, sid, [ev("r9", 1, "k", put="z", clock={"r1": 0, "r2": 0})]
+    )
+    assert_422(r, "unknown_replica_id")
+    assert sess_get(hid, sid).json()["event_count"] == 0
+
+    # Clock missing/extra components -> 422.
+    r = sess_append(
+        hid, sid, [ev("r1", 2, "k", put="z", clock={"r1": 2})]
+    )
+    assert_422(r, "clock_replica_coverage")
+    r = sess_append(
+        hid,
+        sid,
+        [ev("r1", 2, "k", put="z", clock={"r1": 2, "r2": 0, "r3": 0})],
+    )
+    assert_422(r, "clock_replica_coverage")
+
+    # Own component must equal seq even with gaps present.
+    r = sess_append(
+        hid, sid, [ev("r1", 9, "k", put="z", clock={"r1": 8, "r2": 0})]
+    )
+    detail = assert_422(r, "clock_self_component")
+    assert detail[0]["event_index"] == 0
+
+    # A legal event in the same request as an illegal one does NOT land:
+    # failed appends never modify staging.
+    r = sess_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "ok", put="z", clock={"r1": 2, "r2": 1}),
+            ev("r9", 1, "bad", put="z", clock={"r1": 0, "r2": 0}),
+        ],
+    )
+    assert r.status_code == 422, r.text
+    assert sess_get(hid, sid).json()["event_count"] == 0
+
+    # Schema-level field violations (bad op, seq 0, empty events) -> 422.
+    r = sess_append(
+        hid,
+        sid,
+        [
+            {
+                "replica_id": "r1",
+                "seq": 2,
+                "key": "k",
+                "put": "x",
+                "delete": "delete",
+                "clock": {"r1": 2, "r2": 1},
+            }
+        ],
+    )
+    assert r.status_code == 422
+    r = sess_append(
+        hid, sid, [ev("r1", 0, "k", put="z", clock={"r1": 0, "r2": 0})]
+    )
+    assert r.status_code == 422
+    r = client.post(
+        f"/api/histories/{hid}/import-sessions/{sid}/events",
+        json={"events": []},
+    )
+    assert r.status_code == 422
+
+
+def test_import_session_duplicate_rules_and_120_staging_cap():
+    hid = create_conflict_history()
+    sid = sess_create(hid).json()["id"]
+
+    one = ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1})
+
+    # First staging of the identity.
+    assert sess_append(hid, sid, [one]).status_code == 200
+
+    # Identical content (clock key order irrelevant) -> ignored.
+    r = sess_append(
+        hid,
+        sid,
+        [
+            {
+                "replica_id": "r1",
+                "seq": 2,
+                "key": "k",
+                "put": "x",
+                "clock": {"r2": 1, "r1": 2},
+            }
+        ],
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["event_count"] == 1
+
+    # Different content on the same identity -> 409, staging untouched.
+    before = sess_get(hid, sid).json()
+    r = sess_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="different", clock={"r1": 2, "r2": 1}),
+        ],
+    )
+    assert r.status_code == 409, r.text
+    err = r.json()["detail"][0]
+    assert err["code"] == "event_content_mismatch"
+    assert err["event_index"] == 0
+    assert sess_get(hid, sid).json()["events"] == before["events"]
+
+    # Extra zero-valued clock component also counts as different content,
+    # and a legal second event in the same request is not staged.
+    r = sess_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "k", put="x", clock={"r1": 2, "r2": 1, "r3": 0}),
+            ev("r2", 2, "k", put="y", clock={"r1": 2, "r2": 2}),
+        ],
+    )
+    assert r.status_code == 409
+    assert sess_get(hid, sid).json()["event_count"] == 1
+
+    # At most 120 distinct staged events: r1/2 is staged already; append
+    # r1/3..r1/120 plus r2/2 to bring the session to exactly 120.
+    tail = [
+        ev("r1", n, "k", put="t", clock={"r1": n, "r2": 1})
+        for n in range(3, 121)
+    ]
+    tail.append(ev("r2", 2, "k", put="y", clock={"r1": 2, "r2": 2}))
+    assert len(tail) == 119
+    r = sess_append(hid, sid, tail)
+    assert r.status_code == 200, r.text
+    assert r.json()["event_count"] == 120
+
+    r = sess_append(
+        hid, sid, [ev("r2", 3, "k", put="z", clock={"r1": 2, "r2": 3})]
+    )
+    assert_422(r, "batch_full")
+    # The rejected append changes nothing.
+    assert sess_get(hid, sid).json()["event_count"] == 120
+
+
+def test_import_session_commit_merges_into_latest_history_and_closes():
+    # History already has r1/1; the session stages out-of-order arrivals
+    # r2/1, r1/2 (r2/1 staged second).  Commit returns the ordinary history
+    # read structure over all four committed events.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+
+    assert sess_append(
+        hid, sid, [ev("r1", 2, "k", put="c", clock={"r1": 2, "r2": 1})]
+    ).status_code == 200
+    assert sess_append(
+        hid, sid, [ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1})]
+    ).status_code == 200
+
+    r = sess_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    # Commit response is exactly the history read structure.
+    assert set(data) == {"id", "replica_ids", "events", "results"}
+    assert data["id"] == hid
+    assert [(e["replica_id"], e["seq"]) for e in data["events"]] == [
+        ("r1", 1),
+        ("r1", 2),
+        ("r2", 1),
+    ]
+    (verdict,) = data["results"]
+    assert verdict["state"] == "put"
+    assert verdict["value"] == "c"
+
+    # The closure and the merge took effect together.
+    got = hist_get(hid).json()
+    assert got["events"] == data["events"]
+    assert got["results"] == data["results"]
+    status = sess_get(hid, sid).json()
+    assert status["status"] == "closed"
+    # Closed sessions retain their staged events for inspection.
+    assert [(e["replica_id"], e["seq"]) for e in status["events"]] == [
+        ("r1", 2),
+        ("r2", 1),
+    ]
+
+    # Any append or re-commit on the closed session is 409.
+    r = sess_append(
+        hid, sid, [ev("r1", 3, "k", put="z", clock={"r1": 3, "r2": 1})]
+    )
+    assert r.status_code == 409
+    assert r.json()["detail"][0]["code"] == "session_closed"
+    r = sess_commit(hid, sid)
+    assert r.status_code == 409
+    assert r.json()["detail"][0]["code"] == "session_closed"
+
+
+def test_import_session_commit_missing_dependency_is_422_then_retry_succeeds():
+    # Stage r2/2 without r2/1: staging accepts it, commit fails the original
+    # full validation; the session stays open with its data, the history is
+    # untouched, and appending the missing event makes the retry succeed.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+
+    assert sess_append(
+        hid, sid, [ev("r2", 2, "k2", put="x", clock={"r1": 1, "r2": 2})]
+    ).status_code == 200
+
+    r = sess_commit(hid, sid)
+    assert_422(r, "non_contiguous_seq")
+
+    state = sess_get(hid, sid).json()
+    assert state["status"] == "open"
+    assert [(e["replica_id"], e["seq"]) for e in state["events"]] == [
+        ("r2", 2)
+    ]
+    assert hist_get(hid).json()["events"] == [
+        ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})
+    ]
+
+    # Fill the gap and retry.
+    assert sess_append(
+        hid, sid, [ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1})]
+    ).status_code == 200
+    r = sess_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 1),
+        ("r2", 1),
+        ("r2", 2),
+    ]
+    assert sess_get(hid, sid).json()["status"] == "closed"
+
+
+def test_import_session_commit_against_mismatched_committed_event_is_409():
+    # Committed r1/1 put 'a'; a session stages r1/1 with different content
+    # (legal in isolation: own component equals seq, clock covers replicas).
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+
+    assert sess_append(
+        hid, sid, [ev("r1", 1, "k", put="different", clock={"r1": 1, "r2": 0})]
+    ).status_code == 200
+
+    r = sess_commit(hid, sid)
+    assert r.status_code == 409, r.text
+    assert (
+        r.json()["detail"][0]["code"] == "event_content_mismatch"
+    )
+    # Failure keeps the open session and its data; the history is unchanged.
+    assert sess_get(hid, sid).json()["status"] == "open"
+    assert hist_get(hid).json()["events"][0]["put"] == "a"
+
+
+def test_import_session_commit_identical_to_history_is_ignored():
+    hid = create_conflict_history()
+    sid = sess_create(hid).json()["id"]
+    same = two_branch_conflict()
+
+    assert sess_append(hid, sid, same).status_code == 200
+    assert sess_get(hid, sid).json()["event_count"] == 2
+
+    r = sess_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    # Nothing new merged, but the session is still closed.
+    assert len(r.json()["events"]) == 2
+    assert sess_get(hid, sid).json()["status"] == "closed"
+
+
+def test_import_session_commit_enforces_120_total_event_cap():
+    # One committed event + 120 staged distinct events = 121 at commit.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+    staged = [
+        ev("r1", n, "k", put="x", clock={"r1": n, "r2": 0})
+        for n in range(2, 122)
+    ]
+    assert len(staged) == 120
+    assert sess_append(hid, sid, staged).status_code == 200
+
+    r = sess_commit(hid, sid)
+    assert_422(r, "batch_full")
+    # Session remains usable and history keeps its single event.
+    assert sess_get(hid, sid).json()["status"] == "open"
+    assert len(hist_get(hid).json()["events"]) == 1
+
+
+def test_import_session_empty_commit_is_idempotent_close():
+    hid = create_conflict_history()
+    sid = sess_create(hid).json()["id"]
+
+    r = sess_commit(hid, sid)
+    assert r.status_code == 200, r.text
+    assert [(e["replica_id"], e["seq"]) for e in r.json()["events"]] == [
+        ("r1", 1),
+        ("r2", 1),
+    ]
+    assert sess_get(hid, sid).json()["status"] == "closed"
+
+
+def test_import_session_does_not_affect_old_reads_and_withdraw_preview():
+    hid = create_conflict_history()
+    sid = sess_create(hid).json()["id"]
+    before = hist_get(hid).json()
+
+    sess_append(
+        hid,
+        sid,
+        [
+            ev("r1", 2, "other", put="z", clock={"r1": 2, "r2": 1}),
+            ev("r2", 9, "later", put="q", clock={"r1": 2, "r2": 9}),
+        ],
+    )
+
+    # Ordinary read and the read-only preview never observe staged events.
+    assert hist_get(hid).json() == before
+    preview = hist_withdraw(hid, "r1", 1)
+    assert preview.status_code == 200
+    assert [(d["replica_id"], d["seq"]) for d in preview.json()["withdrawn"]] == [
+        ("r1", 1),
+    ]
+    assert sess_get(hid, sid).json()["status"] == "open"
+
+
+def test_import_session_concurrent_with_old_write_loses_no_events():
+    # Session stages r2/1; the old events endpoint concurrently tries to
+    # merge r2/2 (which causally needs r2/1).  BEGIN IMMEDIATE serialises
+    # the two transactions: exactly one ordering happens, neither write is
+    # lost, and retrying the loser yields the full history.
+    hid = hist_create(
+        ["r1", "r2"],
+        [ev("r1", 1, "k", put="a", clock={"r1": 1, "r2": 0})],
+    ).json()["id"]
+    sid = sess_create(hid).json()["id"]
+    assert sess_append(
+        hid, sid, [ev("r2", 1, "k", put="b", clock={"r1": 1, "r2": 1})]
+    ).status_code == 200
+    barrier = threading.Barrier(2)
+
+    def via_session():
+        cc = TestClient(app)
+        barrier.wait()
+        return cc.post(f"/api/histories/{hid}/import-sessions/{sid}/commit")
+
+    def via_merge():
+        cc = TestClient(app)
+        barrier.wait()
+        return cc.post(
+            f"/api/histories/{hid}/events",
+            json={
+                "events": [
+                    ev("r2", 2, "k", put="c", clock={"r1": 1, "r2": 2})
+                ]
+            },
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda f: f(), [via_session, via_merge]))
+
+    assert all(r.status_code in (200, 422) for r in results), [
+        r.text for r in results
+    ]
+    # If the merge landed first it lacked r2/1 and failed; retry it now that
+    # the session commit has serialized r2/1 into the history.
+    if any(r.status_code == 422 for r in results):
+        retry = client.post(
+            f"/api/histories/{hid}/events",
+            json={
+                "events": [
+                    ev("r2", 2, "k", put="c", clock={"r1": 1, "r2": 2})
+                ]
+            },
+        )
+        assert retry.status_code == 200, retry.text
+
+    got = hist_get(hid).json()
+    assert sorted((e["replica_id"], e["seq"]) for e in got["events"]) == [
+        ("r1", 1),
+        ("r2", 1),
+        ("r2", 2),
+    ]
+    # A commit that ran is closed; one that lost is still open and its
+    # second commit is then a 409/ignored identity merge.
+    assert sess_get(hid, sid).json()["status"] == "closed"
+
+
+def test_import_session_survives_process_restart(tmp_path):
+    db = tmp_path / "history.db"
+    env = dict(os.environ, HISTORY_DB_PATH=str(db), PYTHONPATH="/workspace")
+
+    def run(code):
+        return subprocess.run(
+            [sys.executable, "-c", code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    create = run(
+        """
+from fastapi.testclient import TestClient
+from app.main import app
+c = TestClient(app)
+h = c.post('/api/histories', json={
+    'replica_ids': ['r1', 'r2'],
+    'events': [
+        {'replica_id': 'r1', 'seq': 1, 'key': 'k', 'put': 'a',
+         'clock': {'r1': 1, 'r2': 0}},
+    ],
+}).json()['id']
+s = c.post(f'/api/histories/{h}/import-sessions').json()['id']
+r = c.post(f'/api/histories/{h}/import-sessions/{s}/events', json={'events': [
+    {'replica_id': 'r2', 'seq': 2, 'key': 'k2', 'put': 'x',
+     'clock': {'r1': 1, 'r2': 2}},
+    {'replica_id': 'r2', 'seq': 1, 'key': 'k', 'put': 'b',
+     'clock': {'r1': 1, 'r2': 1}},
+]})
+assert r.status_code == 200, r.text
+print(h, s)
+"""
+    )
+    assert create.returncode == 0, create.stderr
+    hid, sid = create.stdout.split()
+
+    # Fresh process: the open session and its out-of-order staging are still
+    # there; commit works and closes it.
+    commit = run(
+        f"""
+from fastapi.testclient import TestClient
+from app.main import app
+c = TestClient(app)
+g = c.get('/api/histories/{hid}/import-sessions/{sid}')
+assert g.status_code == 200, g.text
+d = g.json()
+assert d['status'] == 'open' and d['event_count'] == 2, d
+assert [(e['replica_id'], e['seq']) for e in d['events']] == [
+    ('r2', 1), ('r2', 2)]
+r = c.post('/api/histories/{hid}/import-sessions/{sid}/commit')
+assert r.status_code == 200, r.text
+assert [(e['replica_id'], e['seq']) for e in r.json()['events']] == [
+    ('r1', 1), ('r2', 1), ('r2', 2)]
+assert c.get('/api/histories/{hid}/import-sessions/{sid}').json()['status'] \\
+    == 'closed'
+print('ok')
+"""
+    )
+    assert commit.returncode == 0, commit.stderr
+    assert commit.stdout.strip() == "ok"

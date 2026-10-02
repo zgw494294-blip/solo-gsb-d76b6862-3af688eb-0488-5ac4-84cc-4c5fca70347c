@@ -1,7 +1,10 @@
 """SQLite persistence for mergeable offline-event histories.
 
 Each history is one table row holding the fixed ``replica_ids`` and the full
-event list (canonical JSON).  Every request opens a short-lived connection:
+event list (canonical JSON).  Import sessions (``import_sessions``) are a
+second row family that stages out-of-order events for one history until a
+commit folds them into the history row in the same transaction that closes
+the session.  Every request opens a short-lived connection:
 
 * writes take a ``BEGIN IMMEDIATE`` transaction, which acquires the database
   reserved lock up front.  Concurrent writers therefore serialise, and a
@@ -34,6 +37,14 @@ CREATE TABLE IF NOT EXISTS histories (
     replica_ids TEXT NOT NULL,
     events      TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS import_sessions (
+    id         TEXT PRIMARY KEY,
+    history_id TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    events     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_sessions_history
+    ON import_sessions(history_id);
 """
 
 
@@ -56,7 +67,7 @@ def _connect(*, for_write: bool) -> sqlite3.Connection:
         if path != ":memory:":
             conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(_SCHEMA)
+        conn.executescript(_SCHEMA)
         conn.execute("BEGIN IMMEDIATE")
     return conn
 
@@ -136,4 +147,77 @@ def update_events(
     conn.execute(
         "UPDATE histories SET events = ? WHERE id = ?",
         (json.dumps(events, ensure_ascii=False), history_id),
+    )
+
+
+def get_import_session(
+    session_id: str,
+) -> sqlite3.Row | None:
+    """Committed snapshot of one import session, or None when absent.
+
+    Like :func:`get_history`, uses a fresh autocommit connection and treats a
+    not-yet-created schema as "no session exists".
+    """
+
+    try:
+        conn = _connect(for_write=False)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        try:
+            cursor = conn.execute(
+                "SELECT id, history_id, status, events "
+                "FROM import_sessions WHERE id = ?",
+                (session_id,),
+            )
+        except sqlite3.OperationalError:
+            return None
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def insert_import_session(
+    conn: sqlite3.Connection,
+    session_id: str,
+    history_id: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO import_sessions (id, history_id, status, events) "
+        "VALUES (?, ?, 'open', '[]')",
+        (session_id, history_id),
+    )
+
+
+def select_import_session_for_update(
+    conn: sqlite3.Connection, session_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT id, history_id, status, events "
+        "FROM import_sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+
+
+def update_import_session_events(
+    conn: sqlite3.Connection, session_id: str, events: list[dict]
+) -> None:
+    import json
+
+    conn.execute(
+        "UPDATE import_sessions SET events = ? WHERE id = ?",
+        (json.dumps(events, ensure_ascii=False), session_id),
+    )
+
+
+def close_import_session(
+    conn: sqlite3.Connection, session_id: str, events: list[dict]
+) -> None:
+    """Atomically persist the staged events and close the session."""
+
+    import json
+
+    conn.execute(
+        "UPDATE import_sessions SET status = 'closed', events = ? WHERE id = ?",
+        (json.dumps(events, ensure_ascii=False), session_id),
     )
