@@ -29,6 +29,13 @@
 所有直接或间接依赖它的事件（跨 key）都会计入，无关并发事件保留；只返回预演
 结果，**不实际删除、不重排序号或时钟、不改动已提交历史**。
 
+最后是一组**导入会话**接口（`/api/histories/{id}/import-sessions`）：离线事件
+分几次到达时，先按历史 ID 开一个空会话，把每批事件**暂存**进去（暂存只校验单
+事件本身，允许前序或跨副本依赖尚未到达），收齐后一次**提交**——提交把暂存事件
+与历史最新已提交状态按原规则合并（完整判等、因果校验、120 条总上限），成功即
+封闭会话。提交失败（缺依赖等）时开放会话与已暂存数据原样保留，补齐后可直接
+重试。会话同样持久化在 SQLite 中，进程/容器重启后可继续暂存与提交。
+
 ## 启动
 
 需要 Docker 与 Docker Compose v2（`docker compose` 子命令）。
@@ -56,6 +63,10 @@ docker compose down
 | 汇入离线事件 | `POST http://localhost:8000/api/histories/{id}/events` |
 | 提交冲突处理 | `POST http://localhost:8000/api/histories/{id}/resolve-conflict` |
 | 撤除预演（只读，不落任何写入） | `GET http://localhost:8000/api/histories/{id}/withdraw-preview?replica_id=r1&seq=1` |
+| 创建导入会话 | `POST http://localhost:8000/api/histories/{id}/import-sessions` |
+| 查询会话状态与暂存事件 | `GET http://localhost:8000/api/histories/{id}/import-sessions/{sid}` |
+| 暂存一批事件 | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/events` |
+| 提交会话（汇入并封闭） | `POST http://localhost:8000/api/histories/{id}/import-sessions/{sid}/commit` |
 | Swagger UI | <http://localhost:8000/docs> |
 | OpenAPI 文档 | <http://localhost:8000/openapi.json> |
 
@@ -909,6 +920,210 @@ curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
 curl -sS -i -G "http://localhost:8000/api/histories/$HID/withdraw-preview" \
   --data-urlencode 'replica_id=r1' --data-urlencode 'seq=0'
 ```
+
+## 导入会话接口 `/api/histories/{id}/import-sessions`
+
+离线事件**分几次到达**时，不必每批都直接汇入历史：先按历史 ID 开一个**导入
+会话**，把各批事件暂存进去，收齐后一次提交。会话与历史一样持久化在 SQLite
+中，进程/容器重启后可继续暂存与提交；暂存中的事件**不影响**历史的读取、裁决
+与撤除预演，只有提交成功才会改变已提交历史。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/histories/{id}/import-sessions` | 在该历史上创建空会话，返回 `{"id": ...}`（201） |
+| `GET` | `/api/histories/{id}/import-sessions/{sid}` | 查询会话状态（`open`/`closed`）与暂存事件（原格式，按 `replica_id`、`seq` 排序） |
+| `POST` | `/api/histories/{id}/import-sessions/{sid}/events` | 暂存一批事件（请求体只有 `events`），返回更新后的会话状态 |
+| `POST` | `/api/histories/{id}/import-sessions/{sid}/commit` | 把暂存事件一次汇入历史并封闭会话，返回与 `GET /api/histories/{id}` 相同的结构 |
+
+暂存规则（每次追加**全部生效或全部不生效**，失败不改暂存）：
+
+- 只做**单事件**校验：字段合法（`put`/`delete` 二选一等）、副本属于该历史、
+  `clock` 恰好覆盖全部副本、本副本分量等于 `seq`；违例 **422**；
+- **允许前序事件或跨副本依赖尚未到达**（连续性、因果、依赖存在性都留到提交时
+  检查），事件可按任意顺序、任意批次追加；
+- 按 `(replica_id, seq)` 判等：同标识且**完整内容**相同（含完整 `clock`，键序
+  无关）的重复追加被忽略；同标识异内容 **409**
+  （`event_content_mismatch`，带追加批次的 `event_index`）；
+- 每个会话至多暂存 **120 个不同事件**，超出 **422**（`batch_full`）。
+
+提交规则：
+
+- 在写锁内读取历史**最新已提交**状态，把暂存事件按原汇入规则合并：与已提交
+  事件同标识同内容的忽略，异内容 **409**；合并后重新执行原整批校验（连续性、
+  因果、依赖存在性、clock 覆盖等）与 **120 条总上限**，违例 **422**；
+- **失败时开放会话与已暂存数据原样保留**，补齐缺失事件后可对同一会话重试；
+- 成功时汇入与封闭**在同一事务中生效**（与旧写接口并发也不会丢事件），响应
+  就是历史的读取结构（`id`、`replica_ids`、排序后的完整 `events`、`results`）；
+- 封闭后的会话再追加或再提交返回 **409**（`session_closed`），会话本身仍可
+  查询；
+- 历史不存在（`history_not_found`）或会话不存在（`session_not_found`，含会话
+  属于其他历史）都返回 **404**。
+
+### 17. 乱序分批暂存，收齐后一次汇入
+
+历史上已提交 `r1/1`（`name = alice`）。`r1/3` 比它的前序 `r1/2` 先到达——
+直接汇入历史会被拒（缺 `r1/2`），但可以先暂存：
+
+```bash
+# 创建历史（已有 r1/1）
+HID=$(curl -sS -X POST http://localhost:8000/api/histories \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "replica_ids": ["r1", "r2"],
+    "events": [
+      {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+       "clock": {"r1": 1, "r2": 0}}
+    ]
+  }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 开导入会话
+SID=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+# 第一批：r1/3 先到（它的前序 r1/2 还没到）——暂存接受
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 3, "key": "name", "put": "alice3",
+       "clock": {"r1": 3, "r2": 0}}
+    ]
+  }'
+
+# 第二批：前序 r1/2 到达
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+       "clock": {"r1": 2, "r2": 0}}
+    ]
+  }'
+```
+
+每次追加都返回更新后的会话状态；也可以随时查询（暂存事件按 `replica_id`、
+`seq` 排序，与到达顺序无关）：
+
+```bash
+curl -sS "http://localhost:8000/api/histories/$HID/import-sessions/$SID"
+```
+
+```json
+{
+  "id": "9c1f…",
+  "history_id": "f82c…",
+  "status": "open",
+  "events": [
+    {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+     "clock": {"r1": 2, "r2": 0}},
+    {"replica_id": "r1", "seq": 3, "key": "name", "put": "alice3",
+     "clock": {"r1": 3, "r2": 0}}
+  ]
+}
+```
+
+收齐后一次提交，响应就是历史的读取结构，会话随之封闭：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID/commit"
+```
+
+```json
+{
+  "id": "f82c…",
+  "replica_ids": ["r1", "r2"],
+  "events": [
+    {"replica_id": "r1", "seq": 1, "key": "name", "put": "alice",
+     "clock": {"r1": 1, "r2": 0}},
+    {"replica_id": "r1", "seq": 2, "key": "name", "put": "alice2",
+     "clock": {"r1": 2, "r2": 0}},
+    {"replica_id": "r1", "seq": 3, "key": "name", "put": "alice3",
+     "clock": {"r1": 3, "r2": 0}}
+  ],
+  "results": [
+    {
+      "key": "name",
+      "state": "put",
+      "value": "alice3",
+      "event": {"replica_id": "r1", "seq": 3, "op": "put", "value": "alice3",
+                "clock": {"r1": 3, "r2": 0}}
+    }
+  ]
+}
+```
+
+### 18. 缺依赖提交失败（422），补齐后对同一会话重试
+
+暂存只校验单事件，依赖是否齐全要到**提交**时才检查。下面暂存的 `r2/1` 时钟
+指向 `r1 = 4`，但 `r1/4` 既不在历史里也不在会话中：
+
+```bash
+SID2=$(curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r2", "seq": 1, "key": "other", "put": "x",
+       "clock": {"r1": 4, "r2": 1}}
+    ]
+  }'
+
+# 提交：依赖的 r1/4 不存在 -> 422
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/commit"
+```
+
+返回 `422 Unprocessable Entity`，且**开放会话与暂存数据原样保留**：
+
+```json
+{
+  "detail": [
+    {
+      "code": "clock_points_to_missing_event",
+      "message": "clock['r1'] = 4, but replica 'r1' has no event with seq 4",
+      "event_index": 3
+    }
+  ]
+}
+```
+
+（`event_index` 是合并后整批——已提交事件加暂存事件——中的下标。）
+
+把缺失的 `r1/4` 补进**同一会话**，重新提交即成功（`r2/1` 依赖的 `r1/4` 随
+同一批汇入）：
+
+```bash
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/events" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "events": [
+      {"replica_id": "r1", "seq": 4, "key": "name", "put": "alice4",
+       "clock": {"r1": 4, "r2": 0}}
+    ]
+  }'
+
+# 重试提交 -> 200，会话封闭
+curl -sS -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/commit"
+
+# 封闭后再追加或再提交 -> 409
+curl -sS -i -X POST "http://localhost:8000/api/histories/$HID/import-sessions/$SID2/commit"
+```
+
+```json
+{
+  "detail": [
+    {
+      "code": "session_closed",
+      "message": "import session '…' is already closed; it accepts no further appends or commits"
+    }
+  ]
+}
+```
+
+暂存期间历史的读取与裁决完全不受会话影响；只有提交成功后，
+`GET /api/histories/{id}` 才会包含汇入的事件。会话与历史一样落在 SQLite
+中，`docker compose restart` 后开放会话可继续暂存与提交。
 
 ## 本地开发（不使用 Docker）
 

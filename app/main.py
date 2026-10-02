@@ -37,6 +37,24 @@ it (across keys) are reported as withdrawn, causally unrelated concurrent
 events remain, and every changed key is shown with its before/after verdict
 (null after when the key empties).  It never modifies the stored history,
 renumbers seqs or rewrites clocks.
+
+A third family of endpoints (/api/histories/{id}/import-sessions) stages
+offline events that arrive in several batches into an import session before
+they touch the persistent history.  A session is created empty by history
+ID and accepts event appends with only the per-event checks (fields,
+replica membership, full clock coverage, self component == seq); missing
+predecessors or cross-replica dependencies are tolerated while staging and
+only fail at commit time.  Re-staging an identical event is ignored, the
+same identity with different content is 409, and a session holds at most
+120 distinct events.  Committing merges the staged events into the
+history's latest committed state with the original full-equality, causal
+and 120-event rules (content mismatch 409, missing dependencies or other
+violations 422) and closes the session; the merge and the close take effect
+in the same transaction, a failed commit leaves the open session and its
+staged events untouched for a retry, and a closed session rejects further
+appends and commits with 409.  Staging never affects the history reads or
+verdicts, and sessions persist in the same SQLite database, so they survive
+restarts.
 """
 
 from __future__ import annotations
@@ -265,6 +283,22 @@ class EventNotFound(Exception):
         super().__init__(f"event ({replica_id!r}, {seq}) not found")
         self.replica_id = replica_id
         self.seq = seq
+
+
+class SessionNotFound(Exception):
+    """No import session with that ID exists on the history (HTTP 404)."""
+
+    def __init__(self, session_id: str):
+        super().__init__(f"import session {session_id!r} not found")
+        self.session_id = session_id
+
+
+class SessionClosedError(Exception):
+    """The import session is already closed; no more appends/commits (409)."""
+
+    def __init__(self, session_id: str):
+        super().__init__(f"import session {session_id!r} is closed")
+        self.session_id = session_id
 
 
 def _err(code: str, message: str, event_index: int | None = None) -> dict:
@@ -644,6 +678,135 @@ def _merge_events(
     # Re-run the original validation on the whole merged history.
     validate_batch(replica_ids, merged)
     return merged
+
+
+def _stage_events(
+    replica_ids: list[str],
+    staged: list[Event],
+    incoming: list[Event],
+) -> list[Event]:
+    """Stage incoming events into an open import session.
+
+    Only the per-event checks apply while staging: the event must belong to
+    one of the history's replicas, its clock must cover exactly all
+    replica_ids, and the clock's own component must equal the event's seq
+    (all 422).  Missing predecessors or cross-replica dependencies are
+    tolerated here and only fail when the session is committed.  Re-staging
+    an identical event (same identity and same full content, including
+    every clock component) is ignored; the same (replica_id, seq) with
+    different content is a 409.  A session stages at most 120 distinct
+    events.  Either the whole append applies or nothing does.
+    """
+
+    replica_set = set(replica_ids)
+
+    errors: list[dict] = []
+    for i, ev in enumerate(incoming):
+        if ev.replica_id not in replica_set:
+            errors.append(
+                _err(
+                    "unknown_replica_id",
+                    f"event replica_id {ev.replica_id!r} is not listed in "
+                    "replica_ids",
+                    i,
+                )
+            )
+        clock_keys = set(ev.clock)
+        if clock_keys != replica_set:
+            missing = sorted(replica_set - clock_keys)
+            extra = sorted(clock_keys - replica_set)
+            parts = []
+            if missing:
+                parts.append(f"missing components for {missing}")
+            if extra:
+                parts.append(f"unexpected components {extra}")
+            errors.append(
+                _err(
+                    "clock_replica_coverage",
+                    "clock must cover exactly all replica_ids: "
+                    + "; ".join(parts),
+                    i,
+                )
+            )
+    if errors:
+        raise BatchError(errors)
+
+    # Coverage is exact from here on, so the self-component lookup is safe.
+    for i, ev in enumerate(incoming):
+        if ev.clock[ev.replica_id] != ev.seq:
+            raise BatchError(
+                [
+                    _err(
+                        "clock_self_component",
+                        f"clock[{ev.replica_id!r}] = {ev.clock[ev.replica_id]} "
+                        f"must equal seq = {ev.seq}",
+                        i,
+                    )
+                ]
+            )
+
+    staged_by_id = {(ev.replica_id, ev.seq): ev for ev in staged}
+    merged = list(staged)
+    for i, ev in enumerate(incoming):
+        prior = staged_by_id.get((ev.replica_id, ev.seq))
+        if prior is not None:
+            if not _same_event_content(prior, ev):
+                raise ConflictStateError(
+                    [
+                        {
+                            "code": "event_content_mismatch",
+                            "message": (
+                                f"event with replica_id {ev.replica_id!r}, "
+                                f"seq {ev.seq} is already staged in this "
+                                "session with different content; staged "
+                                f"{_event_wire(prior)!r}, incoming "
+                                f"{_event_wire(ev)!r}"
+                            ),
+                            "event_index": i,
+                        }
+                    ]
+                )
+            # Same identity, identical content -> ignore.
+            continue
+        staged_by_id[(ev.replica_id, ev.seq)] = ev
+        merged.append(ev)
+
+    if len(merged) > 120:
+        raise BatchError(
+            [
+                _err(
+                    "batch_full",
+                    "the import session already stages 120 distinct events; "
+                    "the 120-event limit leaves no room to stage more",
+                )
+            ]
+        )
+    return merged
+
+
+def _load_session_row(
+    row: object, replica_ids: list[str]
+) -> tuple[str, str, list[Event]]:
+    events = [_wire_model(raw, replica_ids) for raw in json.loads(row["events"])]
+    return row["id"], row["status"], events
+
+
+def _session_state(
+    session_id: str,
+    history_id: str,
+    status: str,
+    events: list[Event],
+    replica_ids: list[str],
+) -> dict:
+    """Session status plus the staged events in original wire format."""
+
+    ordered = sorted(events, key=lambda e: (e.replica_id, e.seq))
+    return {
+        "id": session_id,
+        "history_id": history_id,
+        "status": status,
+        "events": [_canonical_wire(ev, replica_ids) for ev in ordered],
+    }
 
 
 def _key_verdict(key: str, group: list[Event], replica_ids: list[str]) -> dict:
@@ -1179,6 +1342,46 @@ async def event_not_found_handler(
     )
 
 
+@app.exception_handler(SessionNotFound)
+async def session_not_found_handler(
+    request: Request, exc: SessionNotFound
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "detail": [
+                {
+                    "code": "session_not_found",
+                    "message": (
+                        f"this history has no import session with id "
+                        f"{exc.session_id!r}"
+                    ),
+                }
+            ]
+        },
+    )
+
+
+@app.exception_handler(SessionClosedError)
+async def session_closed_handler(
+    request: Request, exc: SessionClosedError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": [
+                {
+                    "code": "session_closed",
+                    "message": (
+                        f"import session {exc.session_id!r} is already "
+                        "closed; it accepts no further appends or commits"
+                    ),
+                }
+            ]
+        },
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def request_validation_error_handler(
     request: Request, exc: RequestValidationError
@@ -1393,3 +1596,135 @@ def commit_history_conflict(history_id: str, body: ConflictDecision) -> dict:
         )
         return {"id": hid, "event": _canonical_wire(new_event, replica_ids),
                 "result": verdict}
+
+
+# ---------------------------------------------------------------------------
+# Import sessions (/api/histories/{id}/import-sessions)
+#
+# Sessions stage offline events that arrive in several batches; the staged
+# events only reach the persistent history when the session is committed.
+# Staging applies the per-event checks only (fields, replica membership,
+# full clock coverage, self component == seq) and tolerates not-yet-arrived
+# predecessors or cross-replica dependencies; commit re-runs the original
+# merge (full-content equality, causal validation, 120-event cap) against
+# the history's latest committed state.  Every mutation runs inside one
+# BEGIN IMMEDIATE transaction together with the history row lock, so a
+# commit serialises with the legacy write endpoints and cannot lose events,
+# the merge and the session close take effect together, and any failure
+# rolls everything back, leaving the open session and its staged events
+# untouched for a retry.
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/histories/{history_id}/import-sessions",
+    tags=["import-sessions"],
+    response_model=None,
+    status_code=201,
+)
+def create_import_session(history_id: str) -> dict:
+    """Open an empty import session on a history and return its ID."""
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        session_id = uuid.uuid4().hex
+        store.insert_session(conn, session_id, history_id)
+    return {"id": session_id}
+
+
+@app.get(
+    "/api/histories/{history_id}/import-sessions/{session_id}",
+    tags=["import-sessions"],
+    response_model=None,
+)
+def read_import_session(history_id: str, session_id: str) -> dict:
+    """Return the session status and its staged events.
+
+    Staged events come back in the original wire format, sorted by
+    replica_id then seq.  Unknown history or session IDs get 404.
+    """
+
+    row = store.get_history(history_id)
+    if row is None:
+        raise HistoryNotFound(history_id)
+    replica_ids: list[str] = json.loads(row["replica_ids"])
+    srow = store.get_session(history_id, session_id)
+    if srow is None:
+        raise SessionNotFound(session_id)
+    sid, status, staged = _load_session_row(srow, replica_ids)
+    return _session_state(sid, history_id, status, staged, replica_ids)
+
+
+@app.post(
+    "/api/histories/{history_id}/import-sessions/{session_id}/events",
+    tags=["import-sessions"],
+    response_model=None,
+)
+def stage_import_session_events(
+    history_id: str, session_id: str, body: MergeEventsRequest
+) -> dict:
+    """Stage a batch of events into an open session and return its state.
+
+    Per-event checks only (422 on illegal fields, unknown replica, clock
+    coverage or self component); missing dependencies are tolerated until
+    commit.  Identical re-staging is ignored, the same identity with
+    different content is 409, and the 120-distinct-event session limit is
+    422.  A failed append changes nothing; a closed session is 409.
+    """
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, _ = _load_row(row)
+        srow = store.select_session_for_update(conn, history_id, session_id)
+        if srow is None:
+            raise SessionNotFound(session_id)
+        if srow["status"] != "open":
+            raise SessionClosedError(session_id)
+        _, status, staged = _load_session_row(srow, replica_ids)
+        merged = _stage_events(replica_ids, staged, body.events)
+        store.update_session_events(
+            conn, session_id, _canonical_events(merged, replica_ids)
+        )
+        return _session_state(session_id, hid, status, merged, replica_ids)
+
+
+@app.post(
+    "/api/histories/{history_id}/import-sessions/{session_id}/commit",
+    tags=["import-sessions"],
+    response_model=None,
+)
+def commit_import_session(history_id: str, session_id: str) -> dict:
+    """Merge the staged events into the history and close the session.
+
+    The merge runs against the history's latest committed state under the
+    same serialised write lock as the legacy write endpoints, with the
+    original full-content equality (identical events are ignored, different
+    content under a stored identity is 409), causal validation and the
+    120-event total limit (violations are 422).  On success the merged
+    history and the session close take effect together and the response is
+    the history read structure; on failure the open session and its staged
+    events are kept, so missing events can be appended and the commit
+    retried.  A closed session is 409.
+    """
+
+    with store.write_transaction() as conn:
+        row = store.select_for_update(conn, history_id)
+        if row is None:
+            raise HistoryNotFound(history_id)
+        hid, replica_ids, committed = _load_row(row)
+        srow = store.select_session_for_update(conn, history_id, session_id)
+        if srow is None:
+            raise SessionNotFound(session_id)
+        if srow["status"] != "open":
+            raise SessionClosedError(session_id)
+        _, _, staged = _load_session_row(srow, replica_ids)
+        merged = _merge_events(replica_ids, committed, staged)
+        store.update_events(
+            conn, hid, _canonical_events(merged, replica_ids)
+        )
+        store.close_session(conn, session_id)
+        return _history_state(hid, replica_ids, merged)
